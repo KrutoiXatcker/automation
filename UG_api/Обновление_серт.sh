@@ -1,219 +1,263 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
-# ====== НАСТРОЙКИ ======
-SERVER="192.168.1.100"
-USER="Admin"
-PASSWORD="123"
-BASE_DIR="./"          # Корневая папка с подпапками сертификатов
-# ========================
+# Запуск: ./auto.sh SERVER USER PASSWORD RESOURCE CRT KEY
+SERVER="${1:?Укажи адрес UG}"
+USER="${2:?Укажи пользователя}"
+PASSWORD="${3:?Укажи пароль}"
+RESOURCE="${4:?Укажи имя правила публикации}"
+CRT_FILE="${5:?Укажи CRT-файл}"
+KEY_FILE="${6:?Укажи KEY-файл}"
 
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-NC='\033[0m'
+BASE_URL="http://${SERVER}:4040/web_api"
 
-# Проверка зависимостей
-for cmd in curl jq base64; do
-    command -v "$cmd" >/dev/null 2>&1 || { echo -e "${RED}Ошибка: $cmd не установлен${NC}"; exit 1; }
-done
-OPENSSL_AVAILABLE=0
-command -v openssl >/dev/null 2>&1 && OPENSSL_AVAILABLE=1
-
-api_call() {
-    local method="$1"
-    local args_json="$2"
-    curl -s -X POST "http://${SERVER}:4040/web_api/${method}" \
-        -H 'Content-Type: application/json' -d "$args_json"
+# Экранирование строк для JSON
+json_escape() {
+    local value="$1"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\n'/\\n}"
+    value="${value//$'\r'/\\r}"
+    value="${value//$'\t'/\\t}"
+    printf '%s' "$value"
 }
 
-find_file() {
-    for p in "$@"; do
-        [ -f "$p" ] && { echo "$p"; return 0; }
-    done
-    return 1
+# Запрос к API
+api() {
+    curl -fsS --max-time 30 "${BASE_URL}/$1" \
+        -H 'Content-Type: application/json' \
+        --data-binary @- <<< "$2"
 }
 
-# Конвертация сертификата DER -> PEM, если нужно
-normalize_cert_to_pem() {
-    local file="$1"
-    if grep -q "BEGIN CERTIFICATE" "$file" 2>/dev/null; then
-        cat "$file"
-    elif [ $OPENSSL_AVAILABLE -eq 1 ]; then
-        openssl x509 -inform DER -in "$file" -outform PEM 2>/dev/null
-    else
-        cat "$file"
-    fi
-}
-
-# Нормализация ключа: PKCS#8 -> традиционный RSA PEM, если нужно
-normalize_key_to_pem() {
-    local key_file="$1"
-    if [ $OPENSSL_AVAILABLE -eq 1 ]; then
-        if grep -q "BEGIN PRIVATE KEY" "$key_file"; then
-            openssl rsa -in "$key_file" -traditional 2>/dev/null || cat "$key_file"
-        else
-            cat "$key_file"
-        fi
-    else
-        cat "$key_file"
-    fi
-}
-
-# Извлечение leaf-сертификата и цепочки из файла
-extract_leaf_chain() {
-    local cert_file="$1"
-    local leaf_file="$2"
-    local chain_file="$3"
-    if [ $OPENSSL_AVAILABLE -eq 1 ]; then
-        # leaf: первый сертификат
-        openssl x509 -in "$cert_file" -outform PEM > "$leaf_file" 2>/dev/null
-        # цепочка: все последующие
-        awk 'BEGIN{n=0} /BEGIN CERTIFICATE/{n++; if(n>1) print_flag=1} print_flag{print}' "$cert_file" > "$chain_file"
-    else
-        # fallback с awk
-        awk 'BEGIN{RS="-----END CERTIFICATE-----"} /BEGIN CERTIFICATE/ {print $0 "-----END CERTIFICATE-----"}' "$cert_file" | head -1 > "$leaf_file"
-        awk 'BEGIN{RS="-----END CERTIFICATE-----"} /BEGIN CERTIFICATE/ {print $0 "-----END CERTIFICATE-----"}' "$cert_file" | tail -n +2 > "$chain_file"
-    fi
-}
-
-# ---------- Аутентификация ----------
-echo -e "${YELLOW}Аутентификация...${NC}"
-auth_token=$(api_call "v2.core.login" "$(jq -nc --arg u "$USER" --arg p "$PASSWORD" '[$u, $p, {}]')" | jq -r '.auth_token // empty')
-[ -z "$auth_token" ] && { echo -e "${RED}Ошибка аутентификации${NC}"; exit 1; }
-echo -e "${GREEN}Успешная аутентификация${NC}"
-
-# ---------- Получение списка сертификатов ----------
-echo -e "${YELLOW}Получение списка сертификатов...${NC}"
-list_resp=$(api_call "v2.settings.certificates.list" "$(jq -nc --arg t "$auth_token" '[$t, 0, 1000, {}]')")
-if echo "$list_resp" | grep -q '"faultCode"'; then
-    echo -e "${RED}Ошибка получения списка: $list_resp${NC}"
+# Проверяем файлы
+if [[ ! -r "$CRT_FILE" || ! -s "$CRT_FILE" ||
+      ! -r "$KEY_FILE" || ! -s "$KEY_FILE" ]]; then
+    echo "CRT или KEY недоступен либо пуст"
     exit 1
 fi
-certs_array=$(echo "$list_resp" | jq '.items')
-[ "$certs_array" = "null" ] && { echo -e "${RED}Не удалось извлечь items${NC}"; exit 1; }
 
-get_cert_id() {
-    echo "$certs_array" | jq -r --arg n "$1" '.[] | select(.name == $n) | .id' | head -1
-}
+# Авторизация
+JSON_DATA="[\"$(json_escape "$USER")\",\"$(json_escape "$PASSWORD")\",{}]"
+RESPONSE=$(api v2.core.login "$JSON_DATA") || exit 1
 
-# ---------- Обработка подпапок ----------
-overall_status=0
-for dir in "$BASE_DIR"/*/; do
-    [ -d "$dir" ] || continue
-    domain=$(basename "$dir")
-    echo -e "\n${YELLOW}=== Обработка: $domain ===${NC}"
+TOKEN_REGEX='"auth_token"[[:space:]]*:[[:space:]]*"([^"]+)"'
 
-    # Поиск файла сертификата
-    cert_file=$(find_file \
-        "${dir}public.cer" "${dir}public.crt" "${dir}certificate.crt" \
-        "${dir}certificate.cer" "${dir}cert.pem" "${dir}${domain}.crt" \
-        "${dir}${domain}.cer" "${dir}"*.crt "${dir}"*.cer "${dir}"*.pem)
-    [ -z "$cert_file" ] && { echo -e "  ${RED}Не найден файл сертификата${NC}"; overall_status=1; continue; }
-
-    # Поиск файла ключа
-    key_file=$(find_file \
-        "${dir}privat.key" "${dir}private.key" "${dir}${domain}.key" \
-        "${dir}"*.key "${dir}"*.pem "${dir}"*.priv)
-    [ -z "$key_file" ] && { echo -e "  ${RED}Не найден файл ключа${NC}"; overall_status=1; continue; }
-
-    # Если key_file совпадает с cert_file (оба .pem), ищем отдельный .key
-    if [ "$key_file" = "$cert_file" ]; then
-        key_file=$(find_file "${dir}"*.key)
-        [ -z "$key_file" ] && { echo -e "  ${RED}Не найден отдельный файл ключа (.key)${NC}"; overall_status=1; continue; }
-    fi
-
-    echo "  Сертификат: $(basename "$cert_file")"
-    echo "  Ключ:       $(basename "$key_file")"
-
-    # Извлекаем leaf и цепочку
-    tmp_leaf=$(mktemp)
-    tmp_chain=$(mktemp)
-    extract_leaf_chain "$cert_file" "$tmp_leaf" "$tmp_chain"
-    leaf_pem=$(cat "$tmp_leaf")
-    if [ -s "$tmp_chain" ]; then
-        chain_pem=$(cat "$tmp_chain")
-    else
-        chain_pem=""
-    fi
-    rm -f "$tmp_leaf" "$tmp_chain"
-
-    # Если цепочки нет в файле, ищем отдельный файл цепочки
-    if [ -z "$chain_pem" ]; then
-        chain_file=$(find_file \
-            "${dir}chain.pem" "${dir}chain.cer" "${dir}chain.crt" \
-            "${dir}fullchain.pem" "${dir}fullchain.cer" "${dir}fullchain.crt" \
-            "${dir}ca.pem" "${dir}ca.cer" "${dir}ca.crt")
-        if [ -n "$chain_file" ]; then
-            chain_pem=$(normalize_cert_to_pem "$chain_file")
-            echo "  Найден отдельный файл цепочки: $(basename "$chain_file")"
-        fi
-    fi
-
-    # Нормализуем ключ
-    key_pem=$(normalize_key_to_pem "$key_file")
-    [ -z "$key_pem" ] && { echo -e "  ${RED}Не удалось прочитать ключ${NC}"; overall_status=1; continue; }
-
-    # Проверка соответствия leaf и ключа (информационно)
-    if [ $OPENSSL_AVAILABLE -eq 1 ]; then
-        cert_mod=$(echo "$leaf_pem" | openssl x509 -noout -modulus 2>/dev/null | openssl md5 | awk '{print $2}')
-        key_mod=$(echo "$key_pem" | openssl rsa -noout -modulus 2>/dev/null | openssl md5 | awk '{print $2}')
-        if [ -n "$cert_mod" ] && [ -n "$key_mod" ]; then
-            if [ "$cert_mod" = "$key_mod" ]; then
-                echo "  Ключ и leaf-сертификат совпадают"
-            else
-                echo -e "  ${YELLOW}Внимание: ключ и leaf-сертификат не совпадают${NC}"
-            fi
-        fi
-    fi
-
-    # Base64
-    cert_b64=$(echo "$leaf_pem" | base64 -w0 2>/dev/null || echo "$leaf_pem" | base64 | tr -d '\n')
-    key_b64=$(echo "$key_pem" | base64 -w0 2>/dev/null || echo "$key_pem" | base64 | tr -d '\n')
-    chain_b64=""
-    if [ -n "$chain_pem" ]; then
-        chain_b64=$(echo "$chain_pem" | base64 -w0 2>/dev/null || echo "$chain_pem" | base64 | tr -d '\n')
-    fi
-
-    cert_id=$(get_cert_id "$domain")
-
-    if [ -n "$cert_id" ]; then
-        echo -e "  Найден сертификат с ID=$cert_id. Обновляем..."
-        update_data=$(jq -nc --arg cert_b64 "$cert_b64" --arg key_b64 "$key_b64" \
-            '{ cert_data: { __base64__: $cert_b64 }, key_data: { __base64__: $key_b64 } }')
-        if [ -n "$chain_b64" ]; then
-            update_data=$(echo "$update_data" | jq --arg chain_b64 "$chain_b64" '. + { chain_data: { __base64__: $chain_b64 } }')
-        fi
-        args=$(jq -nc --arg t "$auth_token" --arg id "$cert_id" --argjson data "$update_data" '[$t, ($id|tonumber), $data]')
-        response=$(api_call "v2.settings.certificate.update" "$args")
-        if ! echo "$response" | grep -q '"faultCode"'; then
-            echo -e "  ${GREEN}✓ Обновлён${NC}"
-        else
-            echo -e "  ${RED}✗ Ошибка: $response${NC}"
-            overall_status=1
-        fi
-    else
-        echo -e "  Сертификат не найден. Добавляем..."
-        cert_data=$(jq -nc --arg name "$domain" --arg cert_b64 "$cert_b64" --arg key_b64 "$key_b64" \
-            '{ name: $name, cert_data: { __base64__: $cert_b64 }, key_data: { __base64__: $key_b64 }, role: "none" }')
-        if [ -n "$chain_b64" ]; then
-            cert_data=$(echo "$cert_data" | jq --arg chain_b64 "$chain_b64" '. + { chain_data: { __base64__: $chain_b64 } }')
-        fi
-        args=$(jq -nc --arg t "$auth_token" --argjson cert "$cert_data" '[$t, $cert]')
-        response=$(api_call "v2.settings.certificate.add" "$args")
-        if ! echo "$response" | grep -q '"faultCode"'; then
-            new_id=$(echo "$response" | jq -r 'if type == "number" then . else .id // empty end')
-            echo -e "  ${GREEN}✓ Добавлен, ID=$new_id${NC}"
-        else
-            echo -e "  ${RED}✗ Ошибка: $response${NC}"
-            overall_status=1
-        fi
-    fi
-done
-
-echo ""
-if [ $overall_status -eq 0 ]; then
-    echo -e "${GREEN}Все сертификаты обработаны успешно${NC}"
+if [[ "$RESPONSE" =~ $TOKEN_REGEX ]]; then
+    TOKEN="${BASH_REMATCH[1]}"
 else
-    echo -e "${RED}Некоторые сертификаты не обработаны${NC}"
+    echo "Ошибка авторизации: $RESPONSE"
     exit 1
 fi
+
+# Закрываем сессию при завершении
+trap 'api v2.core.logout "[\"${TOKEN}\"]" >/dev/null 2>&1' EXIT
+
+# Ищем правило публикации
+RULE_ID=""
+OLD_CERT_ID=""
+MATCHES=0
+OFFSET=0
+
+RULE_REGEX='"id"[[:space:]]*:[[:space:]]*([0-9]+)[^}]*"name"[[:space:]]*:[[:space:]]*"([^"]*)"[^}]*"certificate_id"[[:space:]]*:[[:space:]]*([0-9]+)'
+COUNT_REGEX='"count"[[:space:]]*:[[:space:]]*([0-9]+)'
+CERT_REGEX='"certificate_id"[[:space:]]*:[[:space:]]*([0-9]+)'
+
+while true; do
+    RESPONSE=$(api v1.reverseproxy.rules.list \
+        "[\"${TOKEN}\", ${OFFSET}, 100, {}]") || exit 1
+
+    if [[ "$RESPONSE" =~ $COUNT_REGEX ]]; then
+        COUNT="${BASH_REMATCH[1]}"
+    else
+        echo "Ошибка получения правил: $RESPONSE"
+        exit 1
+    fi
+
+    RULES="$RESPONSE"
+
+    while [[ "$RULES" =~ $RULE_REGEX ]]; do
+        MATCH="${BASH_REMATCH[0]}"
+        ID="${BASH_REMATCH[1]}"
+        NAME="${BASH_REMATCH[2]}"
+        CERT_ID="${BASH_REMATCH[3]}"
+
+        if [[ "$NAME" == "$RESOURCE" ]]; then
+            RULE_ID="$ID"
+            OLD_CERT_ID="$CERT_ID"
+            MATCHES=$((MATCHES + 1))
+        fi
+
+        RULES="${RULES#*"$MATCH"}"
+    done
+
+    OFFSET=$((OFFSET + 100))
+    if (( OFFSET >= COUNT )); then
+        break
+    fi
+done
+
+if (( MATCHES != 1 )); then
+    echo "Для '$RESOURCE' найдено правил: $MATCHES. Нужно одно."
+    exit 1
+fi
+
+if [[ "$OLD_CERT_ID" == "0" ]]; then
+    echo "У правила не выбран сертификат"
+    exit 1
+fi
+
+NEW_NAME="${RESOURCE}-${OLD_CERT_ID}"
+
+echo "Ресурс: $RESOURCE"
+echo "ID правила: $RULE_ID"
+echo "Старый сертификат ID: $OLD_CERT_ID"
+
+# CRT в PEM: первый сертификат — сайт, остальные — цепочка УЦ
+CERT=""
+CHAIN=""
+NUMBER=0
+IN_CERT=0
+
+while IFS= read -r LINE || [[ -n "$LINE" ]]; do
+    LINE="${LINE%$'\r'}"
+
+    if [[ "$LINE" == "-----BEGIN CERTIFICATE-----" ]]; then
+        if (( IN_CERT )); then
+            echo "Некорректный PEM в CRT"
+            exit 1
+        fi
+        NUMBER=$((NUMBER + 1))
+        IN_CERT=1
+    fi
+
+    if (( IN_CERT )); then
+        if (( NUMBER == 1 )); then
+            CERT+="$LINE"$'\n'
+        else
+            CHAIN+="$LINE"$'\n'
+        fi
+    fi
+
+    if [[ "$LINE" == "-----END CERTIFICATE-----" ]]; then
+        IN_CERT=0
+    fi
+done < "$CRT_FILE"
+
+if [[ -z "$CERT" ]] || (( IN_CERT )); then
+    echo "CRT должен содержать полные PEM-блоки CERTIFICATE"
+    exit 1
+fi
+
+# Кодируем сертификат, цепочку и ключ
+CERT_B64=$(printf '%s' "$CERT" | base64 -w 0) || exit 1
+CHAIN_B64=$(printf '%s' "$CHAIN" | base64 -w 0) || exit 1
+KEY_B64=$(base64 -w 0 < "$KEY_FILE") || exit 1
+
+JSON_DATA="[\"${TOKEN}\",{
+    \"name\":\"$(json_escape "$NEW_NAME")\",
+    \"role\":\"none\",
+    \"cert_data\":{\"__base64__\":\"${CERT_B64}\"},
+    \"key_data\":{\"__base64__\":\"${KEY_B64}\"}"
+
+if [[ -n "$CHAIN" ]]; then
+    JSON_DATA+=",\"chain_data\":{\"__base64__\":\"${CHAIN_B64}\"}"
+fi
+
+JSON_DATA+="}]"
+
+# Создаём новый сертификат
+echo "Создаём сертификат: $NEW_NAME"
+RESPONSE=$(api v2.settings.certificate.add "$JSON_DATA") || exit 1
+
+NEW_ID_REGEX='^[[:space:]]*([0-9]+)[[:space:]]*$'
+
+if [[ "$RESPONSE" =~ $NEW_ID_REGEX ]]; then
+    NEW_CERT_ID="${BASH_REMATCH[1]}"
+else
+    echo "Создание сертификата не подтверждено: $RESPONSE"
+    exit 1
+fi
+
+if [[ "$NEW_CERT_ID" == "0" || "$NEW_CERT_ID" == "$OLD_CERT_ID" ]]; then
+    echo "API вернул неожиданный ID: $NEW_CERT_ID"
+    exit 1
+fi
+
+echo "Новый сертификат ID: $NEW_CERT_ID"
+
+# Получаем полные настройки существующего правила
+RULE=$(api v1.reverseproxy.rule.fetch \
+    "[\"${TOKEN}\", ${RULE_ID}]") || exit 1
+
+if [[ "$RULE" =~ $CERT_REGEX ]]; then
+    CERT_FIELD="${BASH_REMATCH[0]}"
+    CURRENT_CERT_ID="${BASH_REMATCH[1]}"
+else
+    echo "Не удалось прочитать сертификат правила: $RULE"
+    exit 1
+fi
+
+if [[ "$CURRENT_CERT_ID" != "$OLD_CERT_ID" ]]; then
+    echo "Сертификат правила уже изменён. Операция остановлена."
+    exit 1
+fi
+
+# Меняем только ссылку на сертификат
+RULE="${RULE/"$CERT_FIELD"/\"certificate_id\":${NEW_CERT_ID}}"
+
+# Убираем служебные поля
+for FIELD in id guid position position_layer; do
+    FIELD_REGEX="\"${FIELD}\"[[:space:]]*:[[:space:]]*(\"[^\"]*\"|[0-9]+)[[:space:]]*,[[:space:]]*"
+
+    if [[ "$RULE" =~ $FIELD_REGEX ]]; then
+        REMOVE="${BASH_REMATCH[0]}"
+        RULE="${RULE/"$REMOVE"/}"
+    else
+        FIELD_REGEX=",[[:space:]]*\"${FIELD}\"[[:space:]]*:[[:space:]]*(\"[^\"]*\"|[0-9]+)"
+
+        if [[ "$RULE" =~ $FIELD_REGEX ]]; then
+            REMOVE="${BASH_REMATCH[0]}"
+            RULE="${RULE/"$REMOVE"/}"
+        fi
+    fi
+done
+
+# Обновляем существующее правило
+RESPONSE=$(api v1.reverseproxy.rule.update \
+    "[\"${TOKEN}\", ${RULE_ID}, ${RULE}]") || exit 1
+
+if [[ ! "$RESPONSE" =~ ^[[:space:]]*true[[:space:]]*$ ]]; then
+    echo "Ошибка переключения правила: $RESPONSE"
+    exit 1
+fi
+
+# Проверяем, что правило использует новый сертификат
+RESPONSE=$(api v1.reverseproxy.rule.fetch \
+    "[\"${TOKEN}\", ${RULE_ID}]") || exit 1
+
+if [[ "$RESPONSE" =~ $CERT_REGEX ]]; then
+    CURRENT_CERT_ID="${BASH_REMATCH[1]}"
+else
+    echo "Не удалось проверить правило. Старый сертификат сохранён."
+    exit 1
+fi
+
+if [[ "$CURRENT_CERT_ID" != "$NEW_CERT_ID" ]]; then
+    echo "Переключение не подтверждено. Старый сертификат сохранён."
+    exit 1
+fi
+
+echo "Правило $RESOURCE переключено: $OLD_CERT_ID → $NEW_CERT_ID"
+
+# Удаляем старый сертификат
+# Если он ещё используется, UG отклонит удаление с ошибкой 502
+RESPONSE=$(api v2.settings.certificate.delete \
+    "[\"${TOKEN}\", ${OLD_CERT_ID}]") || exit 1
+
+if [[ "$RESPONSE" =~ ^[[:space:]]*true[[:space:]]*$ ]]; then
+    echo "Старый сертификат ID=$OLD_CERT_ID удалён."
+else
+    echo "Правило переключено, но старый сертификат не удалён: $RESPONSE"
+    exit 1
+fi
+
+echo "Готово."
